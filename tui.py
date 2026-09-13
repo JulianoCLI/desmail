@@ -138,6 +138,7 @@ class DesmailApp(App):
         self._opening = set()
         self._opened = set()
         self._confirming = set()
+        self._verified_sessions = set()
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         yield Static("[c]Criar+copiar [n]Repetir [r]Inbox+confirm [a]Auto-confirm [y]Copiar [Enter]Abrir msg | auto-confirm ON sweep 15s",
@@ -257,6 +258,11 @@ class DesmailApp(App):
         try:
             ss = await self._to_thread(req, "GET", "/sessions", None, 30)
             await self.refresh_accts(ss)
+            for s in ss:
+                evidence = s.get('confirmation') or {}
+                if evidence.get('verified_at') and s['session_id'] not in self._verified_sessions:
+                    self._verified_sessions.add(s['session_id'])
+                    self.write_log(f"{s['email']}: Confirmado [{evidence['verified_at']}] {evidence['evidence']}")
         except Exception as e:
             self.write_log(f"sessoes: {e}")
             for s in self.ss:

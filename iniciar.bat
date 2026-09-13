@@ -26,11 +26,11 @@ if errorlevel 1 (
     exit /b 1
 )
 
-start "Desmail" /min pythonw tray.py --port 8000
+start "Desmail" /min cmd /k python tray.py --port 8000
 echo Aguardando API iniciar...
 python -c "import time, urllib.request; exec('for attempt in range(60):\n try:\n  with urllib.request.urlopen(\"http://127.0.0.1:8000/openapi.json\", timeout=1) as response:\n   assert response.status == 200\n  break\n except Exception:\n  time.sleep(1)\nelse:\n raise SystemExit(1)')"
 if errorlevel 1 (
-    echo API nao respondeu. Confira erros na janela Desmail API.
+    echo API nao respondeu. Abra a janela minimizada "Desmail" para ver o erro.
     pause
     exit /b 1
 )

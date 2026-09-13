@@ -189,6 +189,7 @@ def test_dns_all_records_must_be_public():
 
 def test_navigation_timeout_closes_only_created_tab():
     class Driver:
+        current_url = api.URL
         def __init__(self):
             self.window_handles = ['inbox', 'other']
             self.current_window_handle = 'inbox'
@@ -199,14 +200,74 @@ def test_navigation_timeout_closes_only_created_tab():
             return 'confirmation'
         def window(self, handle): self.current_window_handle = handle
         def close(self): self.window_handles.remove(self.current_window_handle)
-        def open(self, url): raise TimeoutError('synthetic')
+        def get(self, url): raise TimeoutError('synthetic')
+        def set_page_load_timeout(self, seconds): pass
         def sleep(self, seconds): pass
-        def execute_script(self, script): return ''
+        def execute_script(self, script): return 1 if script == 'return 1' else True
     d = Driver()
     with patch.object(api, '_validate_destination'):
         opened, status, ev = api._open_confirm_isolated(d, 'inbox', 'https://example.org/verify', 0)
     assert not opened and not ev['verified'] and 'TimeoutError' in status
     assert d.window_handles == ['inbox', 'other'] and d.current_window_handle == 'inbox'
+
+
+def test_navegacao_usa_get_e_nunca_open():
+    """d.open() em UC Mode troca para CDP: desconecta o WebDriver e navega em
+    outra aba. A navegacao de confirmacao precisa usar d.get()."""
+    d = Mock(spec=['get', 'open', 'sleep', 'execute_script', 'set_page_load_timeout', 'timeouts'])
+    d.timeouts.page_load = 73
+    d.execute_script.return_value = 'complete'
+    with patch.object(api, '_validate_destination'):
+        api._navigate_confirmation(d, 'https://example.org/verify?t=synthetic', 0)
+    assert d.get.call_args.args == ('https://example.org/verify?t=synthetic',)
+    assert not d.open.called, 'd.open() desconecta o WebDriver em UC Mode'
+    assert [c.args[0] for c in d.set_page_load_timeout.call_args_list] == [30, 73]
+
+
+def test_reconecta_webdriver_caido_em_vez_de_declarar_morto():
+    """Sessao WebDriver caida != Chrome morto. Reconectar antes de desistir."""
+    d = Mock()
+    d.execute_script.side_effect = [Exception('connection refused'), 1]
+    assert api._ensure_connected(d) is True
+    assert d.reconnect.called
+    # Chrome realmente morto: reconnect falha e o driver e dado como perdido.
+    dead = Mock()
+    dead.execute_script.side_effect = Exception('connection refused')
+    dead.reconnect.side_effect = Exception('no such session')
+    assert api._ensure_connected(dead) is False
+
+
+def test_cleanup_da_aba_ocorre_apos_reconexao():
+    """Driver que caiu durante a navegacao ainda precisa fechar a aba criada."""
+    class Driver:
+        current_url = api.URL
+        def __init__(self):
+            self.window_handles = ['inbox']
+            self.current_window_handle = 'inbox'
+            self.switch_to = self
+            self.reconnected = False
+            self._down = False
+        def new_window(self, kind):
+            self.window_handles.append('confirmation')
+            self.current_window_handle = 'confirmation'
+            return 'confirmation'
+        def window(self, handle): self.current_window_handle = handle
+        def close(self): self.window_handles.remove(self.current_window_handle)
+        def set_page_load_timeout(self, seconds): pass
+        def sleep(self, seconds): pass
+        def get(self, url): self._down = True  # UC Mode derruba a sessao
+        def reconnect(self, timeout=0.1):
+            self.reconnected, self._down = True, False
+        def execute_script(self, script):
+            if self._down:
+                raise Exception('connection refused')
+            return 1 if script == 'return 1' else True
+    d = Driver()
+    with patch.object(api, '_validate_destination'):
+        api._open_confirm_isolated(d, 'inbox', 'https://example.org/verify', 0)
+    assert d.reconnected, 'precisa reconectar antes de desistir do cleanup'
+    assert d.window_handles == ['inbox'], 'aba de confirmacao tem de ser fechada'
+    assert d.current_window_handle == 'inbox'
 
 
 def test_release_frees_session_without_waiting_provider():
@@ -624,6 +685,22 @@ def test_quota_endpoint_nao_abre_navegador_e_mostra_orfas():
          patch.object(api, "new_driver", side_effect=AssertionError("nao pode abrir navegador")):
         sem = api.quota()
     assert sem["stale"] is True and sem["free"] is None
+
+
+def test_flags_nunca_quebram_a_pagina_de_confirmacao():
+    """Flags de economia de RAM nao podem impedir a confirmacao.
+
+    imagesEnabled=false faz o Turnstile do smailpro rejeitar o token; as flags
+    de GPU derrubam o WebGL e a pagina de confirmacao para em 'does not support
+    WebGL' sem consumir o token (testado contra o destino real em 2026-09)."""
+    proibidas = {
+        "--blink-settings=imagesEnabled=false",
+        "--disable-gpu",
+        "--disable-software-rasterizer",
+        "--disable-accelerated-2d-canvas",
+    }
+    presentes = proibidas & set(api._MEM_FLAGS)
+    assert not presentes, f"flags quebram a confirmacao: {sorted(presentes)}"
 
 
 def test_new_driver_aplica_flags_de_memoria():
