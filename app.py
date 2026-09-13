@@ -1157,20 +1157,62 @@ def _try_solve_captcha(d):
     return False
 
 
+def _resolve_inbox_handle(d, inbox_handle):
+    """Recupera somente inbox unico validado; nunca navega durante descoberta."""
+    with _LOCK:
+        handles = set(d.window_handles)
+        try:
+            original = d.current_window_handle
+        except Exception:
+            original = None
+
+        def valid(handle):
+            d.switch_to.window(handle)
+            p = urlparse(d.current_url)
+            if (p.scheme != 'https' or p.hostname != 'smailpro.com'
+                    or p.port not in (None, 443) or p.username is not None
+                    or p.password is not None or p.path != '/temporary-email' or p.params):
+                return False
+            return d.execute_script('''
+                if (location.origin !== 'https://smailpro.com' ||
+                    location.pathname !== '/temporary-email') return false;
+                const el = document.querySelector('[x-data="TemporaryEmail()"]');
+                if (!el || !window.Alpine) return false;
+                const inbox = Alpine.$data(el);
+                return !!inbox && Array.isArray(inbox.emails);
+            ''') is True
+
+        try:
+            if inbox_handle in handles and valid(inbox_handle):
+                return inbox_handle
+            candidates = [h for h in handles if valid(h)]
+            if len(candidates) > 1:
+                raise ValueError('inbox ambiguo, abortado')
+            if len(candidates) != 1:
+                raise RuntimeError('inbox ausente ou ambiguo, abortado')
+            inbox_handle = candidates[0]
+            if not valid(inbox_handle):
+                raise RuntimeError('inbox mudou durante recuperacao, abortado')
+            _DRV['inbox_handle'] = inbox_handle
+            return inbox_handle
+        except Exception:
+            try:
+                d.switch_to.window(original)
+            except Exception:
+                pass
+            raise
+
+
 def _refresh_inbox_page(d, inbox_handle):
     """Recarrega smailpro.com na aba do inbox e espera Alpine + Turnstile resolverem.
     Retorna True se a pagina ficou pronta em ate 25s."""
     try:
-        if inbox_handle and inbox_handle not in set(d.window_handles):
-            _log_event(stage="captcha-refresh", result="aba do inbox ausente")
-            return False
-        if inbox_handle:
-            d.switch_to.window(inbox_handle)
+        inbox_handle = _resolve_inbox_handle(d, inbox_handle)
     except Exception as e:
         _log_event(stage="captcha-refresh", result=f"switch:{str(e)[:80]}")
         return False
     try:
-        d.open(URL)
+        d.get(URL)
         d.sleep(2)
     except Exception as e:
         _log_event(stage="captcha-refresh", result=f"open:{str(e)[:80]}")
