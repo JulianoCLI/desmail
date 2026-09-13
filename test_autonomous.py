@@ -626,6 +626,22 @@ def test_quota_endpoint_nao_abre_navegador_e_mostra_orfas():
     assert sem["stale"] is True and sem["free"] is None
 
 
+def test_flags_nunca_quebram_a_pagina_de_confirmacao():
+    """Flags de economia de RAM nao podem impedir a confirmacao.
+
+    imagesEnabled=false faz o Turnstile do smailpro rejeitar o token; as flags
+    de GPU derrubam o WebGL e a pagina de confirmacao para em 'does not support
+    WebGL' sem consumir o token (testado contra o destino real em 2026-09)."""
+    proibidas = {
+        "--blink-settings=imagesEnabled=false",
+        "--disable-gpu",
+        "--disable-software-rasterizer",
+        "--disable-accelerated-2d-canvas",
+    }
+    presentes = proibidas & set(api._MEM_FLAGS)
+    assert not presentes, f"flags quebram a confirmacao: {sorted(presentes)}"
+
+
 def test_new_driver_aplica_flags_de_memoria():
     # _REAL_NEW_DRIVER e capturada no import, antes da fixture bloquear new_driver.
     fake = Mock()

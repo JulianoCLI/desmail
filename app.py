@@ -516,11 +516,18 @@ def _kill_owned_procs():
 
 # ---------- driver unico ----------
 
-# Flags de memoria. Medido em 3 repeticoes (probe_ab3): desligar a GPU corta
-# ~83MB (o processo gpu cai de ~286MB para ~58MB) sem afetar Alpine/Turnstile,
-# pois a pagina do smailpro e so JS/DOM. Flags de particionamento de renderer
-# (--process-per-site, site-per-process) foram medidas e NAO tiveram efeito:
-# ficam de fora em vez de virar configuracao inutil.
+# Flags de memoria. Economia de RAM nunca pode custar a confirmacao: o mesmo
+# Chrome que le o inbox tambem abre a pagina de confirmacao, que pode exigir
+# recursos graficos. Flags de particionamento de renderer (--process-per-site,
+# site-per-process) foram medidas e NAO tiveram efeito: ficam de fora.
+#
+# Removidas apos teste (2026-09), todas por quebrarem o destino:
+#   --blink-settings=imagesEnabled=false : altera o fingerprint do renderer e
+#       faz o Cloudflare Turnstile do smailpro rejeitar o token.
+#   --disable-gpu, --disable-software-rasterizer, --disable-accelerated-2d-canvas
+#       : derrubam o WebGL. A pagina de confirmacao (pokepixel) exige WebGL e
+#       para em "Your browser does not support WebGL" sem consumir o token.
+#       Economizavam ~83MB; a confirmacao vale mais que os 83MB.
 _MEM_FLAGS = (
     "--disable-dev-shm-usage",
     "--disable-extensions",
@@ -529,10 +536,6 @@ _MEM_FLAGS = (
     "--disable-translate",
     "--mute-audio",
     "--renderer-process-limit=2",
-    "--blink-settings=imagesEnabled=false",
-    "--disable-gpu",
-    "--disable-software-rasterizer",
-    "--disable-accelerated-2d-canvas",
 )
 
 
