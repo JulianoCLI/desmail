@@ -549,17 +549,36 @@ def new_driver():
     return d
 
 
+def _ensure_connected(d):
+    """True se o WebDriver responde, reconectando se a sessao caiu.
+
+    UC Mode derruba a sessao WebDriver de proposito em algumas navegacoes
+    (CDP Mode). O Chrome continua vivo: `reconnect()` recria a sessao e os
+    handles das abas permanecem validos. Sem isso, uma simples desconexao
+    seria confundida com navegador morto."""
+    if d is None:
+        return False
+    try:
+        return d.execute_script("return 1") == 1
+    except Exception:
+        pass
+    try:
+        d.reconnect()
+    except Exception:
+        return False
+    try:
+        return d.execute_script("return 1") == 1
+    except Exception:
+        return False
+
+
 def _driver_locked(create=False):
     # 1 chrome para todas as sessoes. Presume _LOCK adquirido.
     # Nunca limpa sessoes: em falha marca desconectadas.
     d = _DRV.get("d")
     if d is not None:
         try:
-            if d.execute_script("return 1") == 1:
-                try:
-                    _DRV["inbox_handle"] = _DRV.get("inbox_handle") or d.current_window_handle
-                except Exception:
-                    pass
+            if _ensure_connected(d):
                 return d
             raise RuntimeError("health-check invalido")
         except Exception as e:

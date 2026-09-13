@@ -209,6 +209,18 @@ def test_navigation_timeout_closes_only_created_tab():
     assert d.window_handles == ['inbox', 'other'] and d.current_window_handle == 'inbox'
 
 
+def test_reconecta_webdriver_caido_em_vez_de_declarar_morto():
+    """Sessao WebDriver caida != Chrome morto. Reconectar antes de desistir."""
+    d = Mock()
+    d.execute_script.side_effect = [Exception('connection refused'), 1]
+    assert api._ensure_connected(d) is True
+    assert d.reconnect.called
+    dead = Mock()
+    dead.execute_script.side_effect = Exception('connection refused')
+    dead.reconnect.side_effect = Exception('no such session')
+    assert api._ensure_connected(dead) is False
+
+
 def test_release_frees_session_without_waiting_provider():
     with TestClient(api.app) as client:
         sid = create(client)
