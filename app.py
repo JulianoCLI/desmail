@@ -322,39 +322,29 @@ def _redact_url(u):
         return ""
 
 
-def _confirm_targets(s, msgs):
+def _confirm_targets(s, msgs, include_cooldown=False):
     return [m for m in (msgs or [])
              if m.get("mid") not in s.get("opened", set())
              and not s.get("attempts", {}).get(m.get("mid"), {}).get("navigation_attempted")
             and m.get("mid") not in s.get("verified", set())
             and s.get("attempts", {}).get(m.get("mid"), {}).get("count", 0) < MAX_ATTEMPTS
-             and s.get("attempts", {}).get(m.get("mid"), {}).get("state") != "ambiguous"
-             and time.monotonic() >= s.get("attempts", {}).get(m.get("mid"), {}).get("next_retry", 0)]
+             and s.get("attempts", {}).get(m.get("mid"), {}).get("state") not in ('ambiguous', 'blocked')
+             and (include_cooldown or time.monotonic() >= s.get("attempts", {}).get(m.get("mid"), {}).get("next_retry", 0))]
 
 
 # ---------- eventos de diagnostico (Etapa 1, sem segredos) ----------
 
-def _log_event(session_id="", mid="", stage="", result="", removal_reason=""):
-    inbox_h, n_handles, origin, path = None, 0, "", ""
-    d = _DRV.get("d")
-    if d is not None:
-        try:
-            hs = list(d.window_handles)
-            n_handles = len(hs)
-        except Exception:
-            n_handles = -1
-        inbox_h = _DRV.get("inbox_handle")
-        try:
-            loc = d.execute_script("return {o:location.origin,p:location.pathname}")
-            if isinstance(loc, dict):
-                origin, path = loc.get("o", ""), loc.get("p", "")
-        except Exception:
-            pass
+def _log_event(session_id="", mid="", stage="", result="", removal_reason="", elapsed_ms=None,
+               confirmation=None, snapshot=None):
+    # Somente memoria: diagnostico nunca espera WebDriver/rede.
     _EVENTS.append({"t": time.time(), "sid": session_id, "mid": str(mid or ""),
                     "stage": stage, "result": str(result or "")[:200],
-                    "inbox_handle": inbox_h, "handles": n_handles,
-                    "origin": origin, "path": "/..." if path else "",
-                    "removal_reason": removal_reason})
+                    "inbox_handle": _DRV.get("inbox_handle"), "handles": _DRV.get("handles"),
+                    "origin": _DRV.get("origin", ""), "path": "",
+                    "elapsed_ms": elapsed_ms,
+                    "removal_reason": removal_reason,
+                    **({'confirmation': dict(confirmation)} if confirmation is not None else {}),
+                    **(snapshot or {})})
 
 
 def _on_driver_failure(reason):
@@ -776,6 +766,17 @@ def _monitor_state(s):
     return 'waiting_email'
 
 
+def _monitoring(s):
+    if not s.get('auto_confirm') or _expired(s) or _monitor_state(s) in ('opened', 'verified', 'disconnected'):
+        return False
+    if any(a.get('in_progress') for a in list(s.get('attempts', {}).values())):
+        return True
+    if any(a.get('navigation_attempted') for a in list(s.get('attempts', {}).values())):
+        return False
+    messages = s.get('messages') or [{'mid': mid} for mid in s.get('attempts', {})]
+    return not messages or bool(_confirm_targets(s, messages, include_cooldown=True))
+
+
 @app.get('/email/status')
 def email_status(session_id: str = Query(...)):
     s = sessions.get(session_id)
@@ -785,9 +786,9 @@ def email_status(session_id: str = Query(...)):
     return {'session_id': session_id, 'email': s['email'], 'state': state,
             'auto_confirm': s.get('auto_confirm', False),
             'expected_hosts': s.get('expected_hosts'), 'timeout_seconds': s.get('timeout_seconds', 600),
-            'monitoring': bool(s.get('auto_confirm')) and not _expired(s)
-                          and state not in ('opened', 'verified', 'disconnected'),
+            'monitoring': _monitoring(s),
             'opened': bool(s.get('opened')), 'verified': bool(s.get('verified')),
+            'confirmation': s.get('confirmation'),
             'error': s.get('confirm_error') or s.get('error', ''),
             'messages': list(s.get('messages', [])), 'inbox_state': s.get('inbox_state'),
             'expires_at': s.get('expires_at')}
@@ -802,8 +803,7 @@ def _worker_tick():
             return
         try:
             active = [(sid, s) for sid, s in list(sessions.items())
-                      if s.get('auto_confirm') and not _expired(s)
-                      and _monitor_state(s) not in ('opened', 'verified', 'disconnected')]
+                      if _monitoring(s)]
             if not active:
                 return
             data = _query_inboxes()
@@ -1191,6 +1191,7 @@ def _resolve_inbox_handle(d, inbox_handle):
             if len(candidates) != 1:
                 raise RuntimeError('inbox ausente ou ambiguo, abortado')
             inbox_handle = candidates[0]
+            # Revalidar apos percorrer abas; falha de inspecao nunca prova unicidade.
             if not valid(inbox_handle):
                 raise RuntimeError('inbox mudou durante recuperacao, abortado')
             _DRV['inbox_handle'] = inbox_handle
@@ -1212,6 +1213,8 @@ def _refresh_inbox_page(d, inbox_handle):
         _log_event(stage="captcha-refresh", result=f"switch:{str(e)[:80]}")
         return False
     try:
+        # d.get() e nao d.open(): d.open() troca para CDP Mode, desconecta o
+        # WebDriver e pode recarregar em outra aba que nao a do inbox.
         d.get(URL)
         d.sleep(2)
     except Exception as e:
@@ -1264,9 +1267,72 @@ def _read_body_with_retry(d, address, mid, inbox_handle):
     return b, err, attempts
 
 
-def _verify_confirmation(d):
-    # ponytail: unknown ate existir contrato autoritativo Pokepixel comprovado.
-    return False, ""
+_CONFIRM_SUCCESS = 'E-mail confirmado com sucesso. Sua conta já está liberada.'
+_CONFIRM_HOST = 'pokepixel.nietore.com'
+_VERIFY_REASONS = ('success_visible', 'token_expired', 'token_used', 'webgl_unsupported',
+                   'unexpected_origin', 'success_not_observed')
+_VERIFY_JS = """
+const expected = arguments[0], host = arguments[1], done = arguments[arguments.length - 1];
+const deadline = performance.now() + 14500;
+function check() {
+  if (location.protocol !== 'https:' || location.hostname !== host || location.port) {
+    done('unexpected_origin'); return;
+  }
+  const normalize = s => s.replace(/\\s+/gu, ' ').trim();
+  const visible = Array.from(document.querySelectorAll('body, body *')).filter(el => {
+    if (!el.getClientRects().length || typeof el.innerText !== 'string') return false;
+    // Nao aceitar ancestral cujo innerText inclui mensagem transparente/oculta.
+    if (Array.from(el.querySelectorAll('*')).some(child =>
+        typeof child.innerText === 'string' && normalize(child.innerText) === normalize(el.innerText))) return false;
+    for (let node = el; node; node = node.parentElement) {
+      const style = getComputedStyle(node);
+      if (style.display === 'none' || style.visibility !== 'visible' || Number(style.opacity) === 0) return false;
+    }
+    return true;
+  });
+  const texts = visible.map(el => normalize(el.innerText));
+  if (texts.includes(expected)) { done('success_visible'); return; }
+  // ponytail: frases negativas exatas; ampliar somente com evidencia redigida do destino.
+  for (const [text, reason] of [
+      ['Token expirado.', 'token_expired'],
+      ['Token já utilizado.', 'token_used'],
+      ['Token já foi utilizado.', 'token_used'],
+      ['Your browser does not support WebGL', 'webgl_unsupported']]) {
+    if (texts.includes(text)) { done(reason); return; }
+  }
+  if (performance.now() >= deadline) { done('success_not_observed'); return; }
+  setTimeout(check, Math.min(250, deadline - performance.now()));
+}
+check();
+"""
+
+
+def _verify_confirmation(d, diagnostic=None):
+    # ponytail: contrato DOM Pokepixel; adicionar outro host so com evidencia propria.
+    previous = None
+    started, started_at = time.monotonic(), time.time()
+    reason = 'success_not_observed'
+    try:
+        previous = d.timeouts.script
+        d.set_script_timeout(15)
+        text = d.execute_async_script(_VERIFY_JS, _CONFIRM_SUCCESS, _CONFIRM_HOST)
+        if isinstance(text, str):
+            if text in _VERIFY_REASONS:
+                reason = text
+            elif ' '.join(text.split()) == _CONFIRM_SUCCESS:
+                reason = 'success_visible'
+    except Exception:
+        reason = 'driver_error'
+    finally:
+        if diagnostic is not None:
+            diagnostic.update(reason=reason, started_at=started_at, observed_at=time.time(),
+                              elapsed_ms=round((time.monotonic() - started) * 1000))
+        if previous is not None:
+            try:
+                d.set_script_timeout(previous)
+            except Exception:
+                _log_event(stage='confirmation-timeout-restore', result='failed')
+    return reason == 'success_visible', _CONFIRM_SUCCESS if reason == 'success_visible' else ''
 
 
 def _validate_destination(url):
@@ -1280,26 +1346,48 @@ def _validate_destination(url):
         raise ValueError('DNS privado/reservado bloqueado')
 
 
-def _navigate_confirmation(d, url, wait_s):
-    """Navegacao leve na aba atual com JS habilitado; nenhum GET HTTP alternativo para o token."""
+def _navigate_confirmation(d, url, wait_s, attempt=None):
+    """Navegacao leve na aba atual com JS habilitado; nenhum GET HTTP alternativo para o token.
+
+    Usa d.get() e NAO d.open(): em UC Mode, d.open() troca para CDP Mode, o que
+    (a) desconecta o WebDriver -- execute_script/window_handles passam a recusar
+    conexao e parecem "driver morto" -- e (b) navega em OUTRA aba, deixando a aba
+    isolada em about:blank. d.get() mantem a sessao WebDriver e a aba corretas.
+    """
     _validate_destination(url)
-    d.open(url)
-    if wait_s:
-        d.sleep(wait_s)
+    previous = None
+    try:
+        previous = d.timeouts.page_load
+        d.set_page_load_timeout(30)
+    except Exception:
+        pass
+    try:
+        # Timeout/erro de transporte pode ocorrer depois do consumo do token.
+        if attempt is not None:
+            attempt['navigation_attempted'] = True
+        d.get(url)
+    finally:
+        try:
+            if previous is not None:
+                d.set_page_load_timeout(previous)
+        except Exception:
+            pass
     try:
         d.execute_script("return document.readyState")
     except Exception as e:
         raise RuntimeError(f'navegacao falhou ({type(e).__name__})')
 
 
-def _open_confirm_isolated(d, inbox_handle, url, wait_s=6):
+def _open_confirm_isolated(d, inbox_handle, url, wait_s=6, confirmation=None, attempt=None):
     # Etapa 2: aba criada via new_window, identificada por diff de handles.
     # Nunca navega na aba do inbox; so fecha a aba criada. Falha aborta.
     try:
+        inbox_handle = _resolve_inbox_handle(d, inbox_handle)
         before = set(d.window_handles)
     except Exception as e:
-        _log_event(stage="tab-create", result=f"handles:{str(e)[:100]}")
-        return False, "handles inacessiveis, abortado", {"verified": False, "evidence": ""}
+        _log_event(stage="tab-create", result=f"handles:{type(e).__name__}")
+        return False, "inbox ausente, ambiguo ou inacessivel, abortado", {
+            "verified": False, "evidence": "", "state": "ambiguous" if isinstance(e, ValueError) else "unknown"}
     if inbox_handle and inbox_handle not in before:
         _log_event(stage="tab-create", result="aba do inbox ausente",
                    removal_reason="navegacao abortada, sessoes preservadas")
@@ -1307,18 +1395,18 @@ def _open_confirm_isolated(d, inbox_handle, url, wait_s=6):
     try:
         created = d.switch_to.new_window("tab")
     except Exception as e:
-        _log_event(stage="tab-create", result=f"new_window:{str(e)[:120]}")
-        return False, f"aba nao criada ({str(e)[:100]})", {"verified": False, "evidence": ""}
+        _log_event(stage="tab-create", result=f"new_window:{type(e).__name__}")
+        return False, "aba nao criada (driver_error)", {"verified": False, "evidence": ""}
     try:
         after = set(d.window_handles)
     except Exception as e:
-        _log_event(stage="tab-create", result=f"handles-pos:{str(e)[:100]}")
+        _log_event(stage="tab-create", result=f"handles-pos:{type(e).__name__}")
         return False, "handles pos-criacao inacessiveis, abortado", {"verified": False, "evidence": ""}
     newh = created if isinstance(created, str) and created in after else None
     if not newh:
         diff = after - before
         newh = diff.pop() if len(diff) == 1 else None
-    if not newh or newh == inbox_handle or newh not in after:
+    if not newh or newh in before or newh not in after:
         try:
             d.switch_to.window(inbox_handle)
         except Exception:
@@ -1326,35 +1414,67 @@ def _open_confirm_isolated(d, inbox_handle, url, wait_s=6):
         _log_event(stage="tab-create", result="aba ambigua, navegacao abortada")
         return False, "aba ambigua, navegacao abortada", {"verified": False, "evidence": ""}
     red = _redact_url(url)
+    _DRV['handles'] = len(after)
+    observed_at = None
+    state = 'unknown'
+    diagnostic = {'reason': 'driver_error', 'started_at': time.time()}
+    correlation = {k: (attempt or {}).get(k, '') for k in ('session_id', 'mid')}
     try:
         d.switch_to.window(newh)
-        _navigate_confirmation(d, url, wait_s)
-        verified, evidence = _verify_confirmation(d)
-        try:
-            origin = d.execute_script("return location.origin")
-            path = d.execute_script("return location.pathname")
-        except Exception:
-            origin, path = "", ""
+        _navigate_confirmation(d, url, wait_s, attempt)
+        navigated = time.monotonic()
+        diagnostic['navigation_completed_at'] = time.time()
+        verified, evidence = _verify_confirmation(d, diagnostic)
+        if verified:
+            _DRV['origin'] = 'https://' + _CONFIRM_HOST
+            observed_at = time.time()
+        diagnostic.update(verified=verified, evidence=evidence, verified_at=observed_at,
+                          host=_CONFIRM_HOST if diagnostic['reason'] in _VERIFY_REASONS
+                          and diagnostic['reason'] != 'unexpected_origin' else None,
+                          mid=correlation['mid'])
+        if confirmation is not None:
+            confirmation.update(diagnostic)
+        _log_event(**correlation, stage='tab-verify', result=diagnostic['reason'], confirmation=diagnostic)
+        # wait_s minimo apos navegacao; observacao conta como espera.
+        remaining = wait_s - (time.monotonic() - navigated)
+        if remaining > 0:
+            time.sleep(remaining)
         status = "aberta e fechada" + (f"; evidencia: {evidence}" if verified else "; sem evidencia de confirmacao")
         _log_event(stage="tab-open", result=f"{red} verified={verified}")
     except Exception as e:
         _log_event(stage="tab-open", result=f"{red} erro:{type(e).__name__}")
+        if isinstance(e, ValueError) and not (attempt or {}).get('navigation_attempted'):
+            state = 'blocked'
         verified, evidence = False, ""
-        reason = str(e) if isinstance(e, (ValueError, RuntimeError)) else type(e).__name__
-        status = f"falha ao abrir ({reason}); resultado unknown"
+        diagnostic.update(reason='destination_blocked' if state == 'blocked' else 'driver_error',
+                          verified=False, evidence='', verified_at=None, observed_at=time.time(),
+                          mid=correlation['mid'])
+        if confirmation is not None:
+            confirmation.update(diagnostic)
+        _log_event(**correlation, stage='tab-verify', result=diagnostic['reason'], confirmation=diagnostic)
+        status = f"falha ao abrir ({diagnostic['reason']}: {type(e).__name__}); resultado unknown"
     finally:
-        try:
-            if newh in set(d.window_handles):
-                d.switch_to.window(newh)
-                d.close()
-        except Exception:
-            verified, evidence = False, ''
-            status = 'falha ao abrir (cleanup da aba falhou); resultado unknown'
-        try:
-            d.switch_to.window(inbox_handle)
-        except Exception:
-            pass
-    return not status.startswith("falha ao abrir"), status, {"verified": verified, "evidence": evidence}
+        # WebDriver desconectado nao e o mesmo que Chrome morto: em UC Mode o
+        # navegador segue vivo e so a sessao WebDriver cai. Tentar reconectar
+        # antes de desistir; so pular o cleanup se nem assim responder.
+        driver_alive = _ensure_connected(d)
+        if driver_alive:
+            try:
+                if newh in set(d.window_handles):
+                    d.switch_to.window(newh)
+                    d.close()
+                    _DRV['handles'] = len(after) - 1
+            except Exception:
+                status += '; cleanup da aba falhou'
+            try:
+                d.switch_to.window(inbox_handle)
+                _DRV['origin'] = ''
+            except Exception:
+                pass
+        else:
+            _log_event(stage="tab-cleanup", result="driver sem resposta, cleanup pulado")
+    return not status.startswith("falha ao abrir"), status, {**diagnostic, "verified": verified, "evidence": evidence,
+                                                           "verified_at": observed_at, "state": state}
 
 
 def _cached_body(d, s, mid):
@@ -1362,11 +1482,11 @@ def _cached_body(d, s, mid):
     if mid in cache:
         return cache[mid], ""
     inbox_h = _DRV.get("inbox_handle")
+    started = time.monotonic()
     try:
-        inbox_h = inbox_h or d.current_window_handle
-    except Exception:
-        pass
-    b, error, captcha_retries = _read_body_with_retry(d, s["email"], mid, inbox_h)
+        b, error, captcha_retries = _read_body_with_retry(d, s["email"], mid, inbox_h)
+    finally:
+        _log_event(s.get('_sid', ''), mid, 'body', elapsed_ms=round((time.monotonic() - started) * 1000))
     _close_modal(d)
     if b and not error:
         cache[mid] = b
@@ -1384,14 +1504,17 @@ def _confirm_one(d, s, m, wait_s, revalidate=False):
     if att is None:
         att = {"count": 0, "in_progress": False, "state": "detected"}
         s["attempts"][mid] = att
-    if ((not revalidate and (mid in s["opened"] or mid in s["verified"] or att.get("navigation_attempted"))) or att.get("in_progress")
+    if ((not revalidate and (mid in s["opened"] or mid in s["verified"] or att.get("navigation_attempted")
+                            or att.get('state') in ('ambiguous', 'blocked'))) or att.get("in_progress")
             or att["count"] >= MAX_ATTEMPTS
             or time.monotonic() < att.get("next_retry", 0)):
         return {"mid": mid, "subject": m.get("subject"), "link": "",
                 "detected": True, "body_loaded": False, "link_found": False,
                 "opened": mid in s["opened"], "verified": mid in s["verified"], "state": att["state"],
-                "status": "limite, cooldown ou tentativa ja processada", "skipped": True}
+                "status": "limite, cooldown ou tentativa ja processada", "skipped": True,
+                "confirmation": att.get('confirmation')}
     att["in_progress"] = True
+    att.update(session_id=s.get('_sid', ''), mid=mid)
     s['phase'] = 'reading_body'
     att["state"] = "body-loading"
     att["count"] += 1
@@ -1424,32 +1547,38 @@ def _confirm_one(d, s, m, wait_s, revalidate=False):
                     "link_found": False, "opened": False, "verified": False,
                     "state": att['state'], "status": why}
         inbox_h = _DRV.get("inbox_handle")
-        try:
-            inbox_h = inbox_h or d.current_window_handle
-        except Exception:
-            pass
         att["state"] = "opening"
         if _expired(s):
             att['state'] = 'unknown'
             return {'mid': mid, 'state': 'expired', 'opened': False, 'verified': False,
                     'status': 'deadline atingido antes da navegacao'}
         s['phase'] = 'opening_link'
-        # Mesmo timeout pode consumir token; auto nunca repete navegacao incerta.
-        att["navigation_attempted"] = True
-        ok, status, ev = _open_confirm_isolated(d, inbox_h, link, max(0, min(wait_s, 30)))
+        confirmation = {'mid': mid, 'verified': False, 'evidence': '', 'verified_at': None,
+                        'reason': 'driver_error', 'started_at': time.time()}
+        s['confirmation'] = confirmation
+        started = time.monotonic()
+        try:
+            ok, status, ev = _open_confirm_isolated(d, inbox_h, link, max(0, min(wait_s, 30)), confirmation, att)
+        finally:
+            if 'observed_at' not in confirmation:
+                confirmation['observed_at'] = time.time()
+            _log_event(s.get('_sid', ''), mid, 'confirmation', elapsed_ms=round((time.monotonic() - started) * 1000))
         verified = ok and bool(ev.get("verified"))
-        att["state"] = "unknown"
+        att['confirmation'] = dict(confirmation)
+        att["state"] = ev.get('state', 'unknown')
         if ok:
             s["opened"].add(mid)
             att["state"] = "verified" if verified else "unknown"
             if verified:
                 s["verified"].add(mid)
         else:
-            if att["count"] >= MAX_ATTEMPTS:
+            if att["count"] >= MAX_ATTEMPTS and att['state'] != 'ambiguous':
                 att["state"] = "failed"
         _log_event(s.get("_sid", ""), mid, "confirm-attempt",
                    f"{_redact_url(link)} opened={ok} verified={verified}")
         return {"mid": mid, "subject": m.get("subject"), "link": link,
+                "confirmation": att['confirmation'],
+                "evidence": ev.get('evidence', ''), "verified_at": ev.get('verified_at'),
                 "link_ref": _redact_url(link),
                 "detected": True, "body_loaded": True, "link_found": True,
                 "opened": ok, "verified": verified, "state": att["state"], "status": status}
@@ -1466,8 +1595,15 @@ def _confirm_one(d, s, m, wait_s, revalidate=False):
             att["state"] = "failed"
 
 
-def _drop(sid):
-    sessions.pop(sid, None)
+def _drop(sid, stage='remove'):
+    s = sessions.pop(sid, None)
+    if s is not None:
+        confirmation = s.get('confirmation')
+        _log_event(sid, (confirmation or {}).get('mid', ''), stage, 'ok',
+                   confirmation=confirmation,
+                   snapshot={'state': _monitor_state(s), 'opened': bool(s.get('opened')),
+                             'verified': bool(s.get('verified')), 'monitoring': False})
+    return s
 
 
 def _free_provider_slots(d, existing=None, keep_free=1):
@@ -1502,14 +1638,24 @@ def create(req: CreateReq):
     if req.domain in PREMIUM_DOMAINS:
         raise HTTPException(403, f"{req.domain} dominio premium")
     dom = req.domain if req.domain in FREE[prov]["domains"] else FREE[prov]["domains"][0]
-    with _LOCK:
-        # Auto-exclui a sessao mais antiga se atingir o limite.
+    # Timeout de 45s impede que o create bloqueie o DESHUB para sempre
+    # quando _LOCK esta segurado por _confirm_one em driver travado.
+    started = time.monotonic()
+    acquired = _LOCK.acquire(blocking=True, timeout=45)
+    _log_event(stage='lock-wait', result='create:acquired' if acquired else 'create:timeout',
+               elapsed_ms=round((time.monotonic() - started) * 1000))
+    if not acquired:
+        raise HTTPException(503, "driver ocupado por outra operacao; tente novamente")
+    started = time.monotonic()
+    try:
+        # Somente sessoes verificadas podem ceder vaga automaticamente.
         if len(sessions) >= MAX_BOXES:
-            oldest_sid = min(sessions, key=lambda k: sessions[k].get("expires_at", 0))
-            oldest = sessions.pop(oldest_sid)
+            replaceable = [sid for sid, s in sessions.items() if s.get('verified')]
+            if not replaceable:
+                raise HTTPException(409, 'limite de sessoes; inspecione e libere uma sessao manualmente')
+            oldest_sid = min(replaceable, key=lambda k: sessions[k].get("expires_at", 0))
+            oldest = _drop(oldest_sid, 'auto-remove')
             _enqueue_delete(oldest.get("email"))
-            _log_event(oldest_sid, "", "auto-remove",
-                       f"substituida por nova; email={oldest.get('email', '')}")
         d = _driver_locked(create=True)
         before = _alp_valid_list(d)
         # A cota de 5 e do provedor, nao da memoria: caixas de execucoes
@@ -1552,6 +1698,9 @@ def create(req: CreateReq):
                          'deadline': time.monotonic() + req.timeout_seconds,
                          'expires_at': time.time() + req.timeout_seconds}
         _log_event(sid, "", "create", f"{prov}/{dom}")
+    finally:
+        _log_event(stage='create-duration', elapsed_ms=round((time.monotonic() - started) * 1000))
+        _LOCK.release()
     return {"session_id": sid, "email": email, "provider": prov, "domain": dom}
 
 
@@ -1561,6 +1710,7 @@ def list_sessions():
     return [{"session_id": k, "email": v["email"], "provider": v.get("provider"),
              "domain": v.get("domain"), "status": v.get("status", "connected"),
              "error": v.get("error", ""),
+             "confirmation": v.get('confirmation'),
              "verified": sorted(v.get("verified", set()))} for k, v in sessions.items()]
 
 
@@ -1628,6 +1778,7 @@ def _busy_inbox(s):
 
 
 def _query_inboxes():
+    started = time.monotonic()
     try:
         return _page_loop_all(_driver_locked())
     except HTTPException as e:
@@ -1635,6 +1786,8 @@ def _query_inboxes():
             raise
         _on_driver_failure(_DRV.get("error") or "driver desconectado")
         return {"ok": False, "error": "driver desconectado"}
+    finally:
+        _log_event(stage='inbox', elapsed_ms=round((time.monotonic() - started) * 1000))
 
 
 def _confirm_cached(token, targets, wait_s):
@@ -1811,7 +1964,9 @@ def autoconfirm(req: ConfirmReq):
                 done.append(_confirm_one(d, s, m, req.wait_s))
     finally:
         _poll_end(token)
-    return {"email": s["email"], "confirmed": done, "deleted": False}
+    return {"email": s["email"], "confirmed": done, "deleted": False,
+            "confirmation": s.get('confirmation'), "monitoring": _monitoring(s),
+            "verified": bool(s.get('verified')), "state": _monitor_state(s)}
 
 
 @app.post("/email/sweep")
@@ -1850,11 +2005,10 @@ def release(req: ReleaseReq):
     # Ciclo criar > usar > confirmar > apagar: libera a sessao da memoria
     # imediatamente, sem esperar o provedor. A exclusao da caixa entra em
     # fila assincrona; o proximo create nao espera essa limpeza.
-    s = sessions.pop(req.session_id, None)
+    s = _drop(req.session_id, 'release')
     if s is None:
         return {"ok": True, "released": False}
     _enqueue_delete(s.get("email"))
-    _log_event(req.session_id, "", "release", "ok")
     return {"ok": True, "released": True, "email": s.get("email")}
 
 
@@ -1874,7 +2028,6 @@ def remove(sid: str):
             except Exception:
                 pass
         _drop(sid)
-        _log_event(sid, "", "remove", "ok")
     return {"ok": True}
 
 
