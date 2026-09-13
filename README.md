@@ -13,12 +13,12 @@ python -m uvicorn app:app --host 127.0.0.1 --port 8000 --workers 1
 - `GET /` e OpenAPI informam versao `2.3.0`.
 - `POST /email/create`: JSON `{provider, domain, server, auto_confirm:true, expected_hosts:null, timeout_seconds:600}`; retorna `{session_id, email, provider, domain}`. Campos novos opcionais. `timeout_seconds` inteiro entre 1 e 3600; booleanos estritos. `expected_hosts`: null ou 1–20 dominios ASCII/punycode exatos, normalizados para minusculas; rejeita URLs, IPs, portas, wildcard, localhost e labels invalidos. Subdominio nao equivale ao dominio pai.
 - `GET /email/status?session_id=...`: somente estado/cache, sem driver, navegacao ou consulta externa. Retorna `state`, `monitoring`, `auto_confirm`, `expected_hosts`, `timeout_seconds`, `expires_at`, `opened`, `verified`, `error`, `messages`, `inbox_state`. Sessao ausente: HTTP 404; entrada invalida: HTTP 422.
-- Estados de status: `waiting_email`, `reading_body`, `opening_link`, `opened`, `verified`, `ambiguous`, `unknown`, `expired`, `disconnected`. `opened` encerra monitoramento, nao comprova verificacao. Evidencia autoritativa continua indisponivel: `verified:false`.
+- Estados de status: `waiting_email`, `reading_body`, `opening_link`, `opened`, `verified`, `ambiguous`, `unknown`, `expired`, `disconnected`. `opened` preserva compatibilidade e encerra monitoramento, mas nao comprova verificacao; consulte `verified` e `confirmation.reason`.
 - `GET /email/check`, `POST /email/poll` e `POST /email/sweep`: mensagens em `messages`, nao links. Estados: `ok`, `empty`, `missing`, `error`, `disconnected`, `in_progress`; `stale` indica cache antigo. Poll ocupado pode retornar `skipped`.
 - `GET /email/body?session_id=...&mid=...`: `best`, `links`, `body_snippet`, `error`. Driver ocupado sem cache retorna `state=in_progress`; repetir depois. Erros de corpo nao entram no cache.
 - `POST /email/open`: JSON `{session_id, mid, wait_s:6, revalidate:false}`. Usa mesmo driver, cache e tentativas do automatico. Mensagem precisa existir no inbox conhecido. `opened` nao significa `verified`.
 - `revalidate:true` permite tentativa manual controlada, respeitando cooldown de 30s e limite de 3 tentativas. Navegacao incerta, inclusive timeout, nunca repete automaticamente.
-- Verificador Pokepixel permanece sem prova autoritativa: resultado `unknown`, `verified:false`. Texto de sucesso, HTTP 200 e espera nao comprovam verificacao.
+- `verified:true` exige texto visivel exato `E-mail confirmado com sucesso. Sua conta já está liberada.` em `https://pokepixel.nietore.com` (443), normalizando somente espacos. Texto generico, oculto, origem diferente, HTTP 200 ou abertura nao bastam. Evidencia DOM, nao consulta independente ao backend da conta.
 - QP somente com metadado explicito `encoding=quoted-printable`; resposta sem encoding preserva corpo literal. Integracao desse metadado no provedor nao foi comprovada.
 
 ## Links de confirmacao genericos
@@ -30,7 +30,7 @@ python -m uvicorn app:app --host 127.0.0.1 --port 8000 --workers 1
 - `GET /email/body` continua somente leitura; acrescenta `state` e `candidates`. `best` fica vazio no empate. Tokens preservam hifen, underscore e percent encoding; logs ocultam caminho, query e fragmento. Corpo e instrucoes nele sao somente dados.
 - Parser reconhece HTTP/HTTPS, mas abertura exige **HTTPS porta 443**. Preflight DNS rejeita qualquer endereco nao global. Navegacao leve executa na aba criada com JavaScript habilitado, permitindo redirects, subresources e pagina dinamica; somente a aba criada e fechada em `finally`. Falha aborta; nenhum HTTP GET alternativo consome token.
 - **Limites de seguranca:** DNS preflight nao fixa IP usado pelo Chrome; existe janela TOCTOU/DNS rebinding. Use filtro de egress que bloqueie redes privadas/reservadas para garantia de rede. Aba compartilha perfil/cookies do Chrome do projeto, nao representa contexto incognito. API sem autenticacao: manter bind em loopback.
-- Navegacao headless leve fecha a aba apos `wait_s` (0-30s); DNS usa timeout do resolvedor do SO. Falha/timeout permanece incerta e nao repete automaticamente.
+- Observacao DOM inicia imediatamente apos navegacao, limitada a 14.5s (timeout de script 15s). `wait_s` (0-30s) continua minimo apos navegacao, incluindo observacao; nao soma espera fixa antes dela. `wait_s:0` nao desliga verificacao. Navegacao tem timeout 30s; DNS usa timeout do SO, portanto nao e limite total HTTP. Falha/timeout permanece incerta e nao repete automaticamente.
 
 ## API autonoma e integracao
 
@@ -56,6 +56,73 @@ memoria na hora e agenda a exclusao no provedor em fila assincrona (worker a cad
 0.5s, sem bloquear create/poll); o proximo create nao espera essa limpeza.
 `DELETE /email/{sid}` continua sincrono quando precisar de garantia imediata.
 `GET /email/status` apos release retorna 404: sessao liberada.
+
+### Diagnostico e decisoes DESHUB
+
+`confirmation` aparece em status, `/email/open` (inclusive repeticao ignorada) e
+resposta normal de `/email/autoconfirm` (tambem em `confirmed[]`). Antes de tentativa
+de abertura vale `null`. Campos de tempo sao segundos Unix; `elapsed_ms` mede apenas
+observacao DOM. `navigation_completed_at` nao existe se navegacao falhou;
+`elapsed_ms` nao existe se observacao nao iniciou. `verified_at` so existe com valor
+quando houve sucesso. `host` e host confiavel ou null, nunca origem arbitraria.
+
+Razoes fixas: `success_visible`, `token_expired`, `token_used`,
+`webgl_unsupported`, `unexpected_origin`, `success_not_observed`, `driver_error`,
+`destination_blocked`. Negativas reconhecem elementos visiveis com texto exato:
+`Token expirado.`, `Token já utilizado.`, `Token já foi utilizado.`,
+`Your browser does not support WebGL`. Outras frases ficam `success_not_observed`
+ao esgotar janela; nao inferir expiracao por idade do email.
+
+Exemplo sintetico completo de `GET /email/status?session_id=demo1234`:
+
+```json
+{
+  "session_id": "demo1234",
+  "email": "offline@example.test",
+  "state": "opened",
+  "auto_confirm": true,
+  "expected_hosts": ["pokepixel.nietore.com"],
+  "timeout_seconds": 600,
+  "monitoring": false,
+  "opened": true,
+  "verified": false,
+  "confirmation": {
+    "mid": "m1",
+    "verified": false,
+    "evidence": "",
+    "verified_at": null,
+    "reason": "success_not_observed",
+    "started_at": 1800000001.0,
+    "navigation_completed_at": 1800000001.0,
+    "observed_at": 1800000015.5,
+    "elapsed_ms": 14500,
+    "host": "pokepixel.nietore.com"
+  },
+  "error": "",
+  "messages": [{"mid": "m1"}],
+  "inbox_state": "ok",
+  "expires_at": 1800000600.0
+}
+```
+
+1. Crie com `auto_confirm:true` e `expected_hosts:["pokepixel.nietore.com"]`.
+   Guarde `session_id`; consulte `GET /email/status` a cada 2-5s.
+2. Somente `verified === true` autoriza marcar verificacao concluida no HUB.
+   `opened`, HTTP 200, `state:unknown`, deadline, `skipped` e 404 nao sao sucesso.
+3. Se `verified !== true` e `monitoring === false`, pare polling de verificacao e
+   mostre `confirmation.reason`; mantenha sessao para revisao. Nao repita token,
+   nao use `revalidate:true` automaticamente e nao remova resultado incerto.
+4. Salve diagnostico antes de liberar sessao apos sucesso. Para investigar remocao,
+   consulte `GET /email/events?session_id=demo1234&limit=500`. Eventos `tab-verify`
+   correlacionam `sid`/`mid`; `remove`, `release`, `auto-remove` retêm `confirmation`,
+   `state`, `opened`, `verified`, `monitoring:false`, com timestamp de remocao em `t`.
+   Buffer global de 500 eventos, somente neste processo; eventos antigos podem
+   ser descartados. 404 posterior nao implica sucesso nem permite recuperar corpo.
+
+Diagnosticos novos retêm somente codigos, evidencia fixa e tempos, sem corpo,
+token ou email. Campos legados de resposta (`email`, `messages`, `link`,
+`candidates`, `/email/body`) continuam sensiveis; HUB deve evitar logar resposta
+inteira. Se `confirmation` nao existir em servidor antigo, tratar como desconhecido.
 
 ## TUI e coordenacao
 
@@ -85,10 +152,8 @@ Tres mecanismos controlam o consumo:
   Sem isso, cada encerramento forcado deixava driver vazando RAM e porta TCP.
   Nunca toca em processo com pai vivo nem no Chrome pessoal (identificado pela
   ausencia de `--remote-debugging-port`).
-- **Flags de memoria** (`_MEM_FLAGS`): sem imagens, extensoes e GPU. Medido em
-  3 repeticoes: desligar a GPU corta **~83 MB** (processo `gpu` cai de ~286 MB
-  para ~58 MB) sem afetar Alpine/Turnstile. Flags de particionamento de renderer
-  foram medidas e descartadas por nao terem efeito.
+- **Flags de memoria** (`_MEM_FLAGS`): imagens/GPU/WebGL preservados; desliga
+  extensoes e atividades de fundo. Desligar GPU impedia confirmacao Pokepixel.
 - **Auto-shutdown por ociosidade** (opt-in): `DESMAIL_IDLE_SHUTDOWN_S=300` fecha
   o Chrome apos 5 min sem sessao; o proximo create reabre. Desligado por padrao
   (`0`), porque reabrir custa ~25 s no primeiro create.
@@ -115,7 +180,8 @@ python -m pytest -q -p no:cacheprovider
 python local_browser_check.py
 ```
 
-Ultima execucao: **129 passed in 15.68s** (`--tb=short`), Chrome local PASS.
+Ultima suite offline: **175 passed in 20.24s** (`--tb=short`). Nesta alteracao,
+DOM executado em Node com ambiente simulado; Chrome/servicos reais nao executados.
 Suite: lifecycle ASGI sem TUI, create/status, validacao, worker/manual, deadline,
 DNS privado, timeout de navegacao, parser, Textual Pilot (Enter com/sem foco, evento antigo, log visivel),
 cache, concorrencia manual/auto, polling lento, timeout, erros HTTP e JS real
