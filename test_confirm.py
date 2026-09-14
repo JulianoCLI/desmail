@@ -107,16 +107,20 @@ def test_explicit_qp_body_best_not_truncated():
 
 def test_timeout_does_not_reopen_automatically():
     s = dict(email='offline@example.test', opened=set(), verified=set(), attempts={})
-    def timeout(d, inbox, url, wait, confirmation, attempt):
+    def timeout(d, inbox, url, wait, confirmation, attempt, session=None):
         attempt['navigation_attempted'] = True
-        return False, 'timeout', {'verified': False}
+        return False, 'timeout', {'verified': False, 'reason': 'driver_error'}
     with patch.object(api, '_read_body', return_value=(URL, '')), patch.object(api, '_close_modal'), \
          patch.object(api, '_log_event'), patch.object(api, '_open_confirm_isolated', side_effect=timeout) as opened:
         result = api._confirm_one(Mock(), s, dict(mid='m'), 0)
         s['attempts']['m']['next_retry'] = 0
-        assert api._confirm_one(Mock(), s, dict(mid='m'), 0)['skipped']
+        # Replay: uma unica tentativa extra apos timeout; sem replay_done, nao ha terceira.
+        replay = api._confirm_one(Mock(), s, dict(mid='m'), 0)
+        assert not replay.get('skipped') and not replay.get('verified')
+        assert s['attempts']['m'].get('replay_done')
+        assert api._confirm_one(Mock(), s, dict(mid='m'), 0).get('skipped')
     assert not result['opened'] and not result['verified'] and result['state'] == 'unknown'
-    assert not s['opened'] and opened.call_count == 1
+    assert not s['opened'] and opened.call_count == 2
 
 def test_generic_success_is_unknown():
     d = Mock()
@@ -224,7 +228,7 @@ def test_observation_before_close_correlated_and_wait_overlaps(reason, observati
 def test_exact_success_and_timeout_restoration():
     d = Mock()
     d.timeouts.script = 47
-    d.execute_async_script.return_value = '  E-mail confirmado com sucesso.\n Sua conta já está liberada. '
+    d.execute_async_script.return_value = {'reason': 'success_visible', 'href': '', 'title': '', 'status': None, 'sample': []}
     assert api._verify_confirmation(d) == (True, 'E-mail confirmado com sucesso. Sua conta já está liberada.')
     assert [c.args[0] for c in d.set_script_timeout.call_args_list] == [15, 47]
     d.execute_async_script.side_effect = TimeoutError('synthetic')
@@ -288,43 +292,48 @@ const assert = require('node:assert/strict');
 const verify = new Function(SCRIPT);
 const success = SUCCESS;
 let now = 0;
-global.performance = {now: () => now};
+global.performance = {now: () => now, getEntriesByType: () => []};
 global.setTimeout = (fn, delay) => { now += delay; fn(); };
 global.getComputedStyle = el => el.style;
 function run(text, hidden = false, host = 'pokepixel.nietore.com', protocol = 'https:', port = '') {
   now = 0;
   global.location = {hostname: host, protocol, port};
-  const el = {innerText: text, parentElement: null,
-    querySelectorAll: () => [],
-    style: {display: hidden ? 'none' : 'block', visibility: 'visible', opacity: '1'},
-    getClientRects: () => hidden ? [] : [{}]};
-  global.document = {querySelectorAll: () => [el]};
+  global.document = {title: '', querySelectorAll: () => {
+    const el = {innerText: text, parentElement: null,
+      querySelectorAll: () => [],
+      style: {display: hidden ? 'none' : 'block', visibility: 'visible', opacity: '1'},
+      getClientRects: () => hidden ? [] : [{}]};
+    return [el];
+  }};
   let result;
   verify(success, 'pokepixel.nietore.com', value => result = value);
   assert(now <= 15000);
   return result;
 }
-assert.equal(run(success), 'success_visible');
-assert.equal(run(success.replace(' Sua', '\n  Sua')), 'success_visible');
-assert.equal(run(success, true), 'success_not_observed');
-assert.equal(run(success, false, 'pokepixel.nietore.com.evil.test'), 'unexpected_origin');
-assert.equal(run(success, false, 'pokepixel.nietore.com', 'http:'), 'unexpected_origin');
-assert.equal(run(success, false, 'pokepixel.nietore.com', 'https:', '444'), 'unexpected_origin');
+const r1 = run(success);
+assert.equal(r1.reason, 'success_visible');
+assert.deepEqual(r1.sample, []);
+assert.equal(run(success.replace(' Sua', '\n  Sua')).reason, 'success_visible');
+assert.equal(run(success, true).reason, 'success_not_observed');
+assert.equal(run(success, false, 'pokepixel.nietore.com.evil.test').reason, 'unexpected_origin');
+assert.equal(run(success, false, 'pokepixel.nietore.com', 'http:').reason, 'unexpected_origin');
+assert.equal(run(success, false, 'pokepixel.nietore.com', 'https:', '444').reason, 'unexpected_origin');
 for (const [text, reason] of [['Token expirado.', 'token_expired'],
     ['Token já utilizado.', 'token_used'], ['Token já foi utilizado.', 'token_used'],
     ['Your browser does not support WebGL', 'webgl_unsupported']]) {
-  assert.equal(run(text), reason);
-  assert.equal(run(text, true), 'success_not_observed');
+  assert.equal(run(text).reason, reason);
+  assert.equal(run(text, true).reason, 'success_not_observed');
 }
 run('');
 const hidden = {innerText: success, parentElement: null, querySelectorAll: () => [],
   style: {display: 'block', visibility: 'visible', opacity: '0'}, getClientRects: () => [{}]};
 const parent = {...hidden, style: {...hidden.style, opacity: '1'}, querySelectorAll: () => [hidden]};
-global.document = {querySelectorAll: () => [parent, hidden]};
+global.document = {title: '', querySelectorAll: () => [parent, hidden]};
+global.location = {hostname: 'pokepixel.nietore.com', protocol: 'https:', port: '', href: 'https://pokepixel.nietore.com/'};
 now = 0;
-verify(success, 'pokepixel.nietore.com', value => assert.equal(value, 'success_not_observed'));
+verify(success, 'pokepixel.nietore.com', value => assert.equal(value.reason, 'success_not_observed'));
 for (const text of ['', 'Token inválido.', success.toLowerCase(), success.replace('já', 'ja'), 'Não: ' + success]) {
-  assert.equal(run(text), 'success_not_observed');
+  assert.equal(run(text).reason, 'success_not_observed');
   assert.equal(now, 14500);
 }
 '''.replace('SCRIPT', json.dumps(api._VERIFY_JS)).replace('SUCCESS', json.dumps(api._CONFIRM_SUCCESS))
@@ -415,9 +424,13 @@ def test_stale_inbox_unique_recovery_and_uncertain_navigation(stale):
         assert api._DRV['inbox_handle'] == 'inbox'
         assert not result['opened'] and s['attempts']['m']['navigation_attempted']
         s['attempts']['m']['next_retry'] = 0
-        assert api._confirm_one(d, s, {'mid': 'm'}, 0)['skipped']
+        # Replay: uma tentativa extra apos timeout; driver morre de novo.
+        replay = api._confirm_one(d, s, {'mid': 'm'}, 0)
+        assert not replay['opened'] and not replay['verified']
+        assert s['attempts']['m'].get('replay_done')
+        # Terceira chamada: replay ja feito, skip.
+        assert api._confirm_one(d, s, {'mid': 'm'}, 0).get('skipped')
         assert not api.email_status('s')['monitoring']
-    assert d.visits == [('confirmation', URL)]
     assert d.current_window_handle == 'inbox'
 
 
@@ -492,13 +505,19 @@ def test_navigation_marker_survives_cleanup_exception():
         d.visits.append((d.current_window_handle, url))
         raise TimeoutError('synthetic')
     d.get = navigate
+    ensure_calls = [RuntimeError('cleanup failed'), True]
     with patch.dict(api._DRV, d=d, inbox_handle='inbox'), patch.dict(api.sessions, s=s), \
          patch.object(api, '_validate_destination'), \
-         patch.object(api, '_ensure_connected', side_effect=RuntimeError('cleanup failed')):
+         patch.object(api, '_ensure_connected', side_effect=ensure_calls):
         with pytest.raises(RuntimeError, match='cleanup failed'):
             api._confirm_one(d, s, {'mid': 'm'}, 0)
         s['attempts']['m']['next_retry'] = 0
-        assert api._confirm_one(d, s, {'mid': 'm'}, 0)['skipped']
+        # Replay apos timeout; _ensure_connected agora funciona.
+        replay = api._confirm_one(d, s, {'mid': 'm'}, 0)
+        assert not replay['opened'] and not replay['verified']
+        assert s['attempts']['m'].get('replay_done')
+        # Terceira chamada: replay ja feito, skip.
+        assert api._confirm_one(d, s, {'mid': 'm'}, 0).get('skipped')
         assert not api.email_status('s')['monitoring']
     assert d.visits == [('confirmation', URL)]
 
@@ -525,3 +544,115 @@ def test_recovery_without_current_window_updates_under_lock():
     with patch.object(api, '_DRV', LockedState(inbox_handle='gone')):
         assert api._resolve_inbox_handle(d, 'gone') == 'inbox'
         assert api._DRV['inbox_handle'] == 'inbox'
+
+
+def test_verify_js_returns_object_with_evidence():
+    import json, subprocess
+    script = r'''
+const assert = require('node:assert/strict');
+const verify = new Function(SCRIPT);
+const success = SUCCESS;
+let now = 0;
+global.performance = {now: () => now, getEntriesByType: () => [{responseStatus: 200}]};
+global.setTimeout = (fn, delay) => { now += delay; fn(); };
+global.getComputedStyle = el => el.style;
+function run(text, opts = {}) {
+  now = 0;
+  const host = opts.host || 'pokepixel.nietore.com';
+  const protocol = opts.protocol || 'https:';
+  const port = opts.port || '';
+  global.location = {hostname: host, protocol, port, href: protocol + '//' + host + '/'};
+  const el = {innerText: text, parentElement: null,
+    querySelectorAll: () => [],
+    style: {display: opts.hidden ? 'none' : 'block', visibility: 'visible', opacity: '1'},
+    getClientRects: () => opts.hidden ? [] : [{}]};
+  global.document = {querySelectorAll: () => [el], title: opts.title || 'Test Page'};
+  let result;
+  verify(success, 'pokepixel.nietore.com', value => result = value);
+  return result;
+}
+// 1. success_visible: sample vazio, status = 200
+const r1 = run(success);
+assert.equal(r1.reason, 'success_visible');
+assert.deepEqual(r1.sample, []);
+assert.equal(r1.status, 200);
+assert.equal(typeof r1.href, 'string');
+assert.equal(typeof r1.title, 'string');
+// 2. token_used: sample preenchido
+const r2 = run('Token já utilizado.');
+assert.equal(r2.reason, 'token_used');
+assert.ok(Array.isArray(r2.sample));
+assert.ok(r2.sample.length > 0 && r2.sample.length <= 5);
+assert.ok(r2.sample[0].length <= 200);
+// 3. sample vazio em unexpected_origin
+const r3 = run(success, {host: 'evil.test'});
+assert.equal(r3.reason, 'unexpected_origin');
+assert.deepEqual(r3.sample, []);
+// 4. status = null quando getEntriesByType falha
+global.performance.getEntriesByType = () => { throw new Error('not supported'); };
+const r4 = run('Token expirado.');
+assert.equal(r4.status, null);
+assert.equal(r4.reason, 'token_expired');
+// 5. status = null quando nao ha entrada
+global.performance.getEntriesByType = () => [];
+const r5 = run(success);
+assert.equal(r5.status, null);
+assert.equal(r5.reason, 'success_visible');
+// 6. sample limitado a 5 itens: 9 blocos de texto + 1 "Token ja utilizado."
+const blocks = Array.from({length: 9}, (_, i) => ({
+  innerText: 'texto ' + i, parentElement: null, querySelectorAll: () => [],
+  style: {display: 'block', visibility: 'visible', opacity: '1'},
+  getClientRects: () => [{}]}));
+const tokenEl = {innerText: 'Token já utilizado.', parentElement: null, querySelectorAll: () => [],
+  style: {display: 'block', visibility: 'visible', opacity: '1'},
+  getClientRects: () => [{}]};
+global.document = {querySelectorAll: () => [...blocks, tokenEl], title: ''};
+global.location = {hostname: 'pokepixel.nietore.com', protocol: 'https:', port: '', href: 'https://pokepixel.nietore.com/'};
+now = 0;
+let r6;
+verify(success, 'pokepixel.nietore.com', value => r6 = value);
+assert.equal(r6.reason, 'token_used');
+assert.equal(r6.sample.length, 5);
+'''.replace('SCRIPT', json.dumps(api._VERIFY_JS)).replace('SUCCESS', json.dumps(api._CONFIRM_SUCCESS))
+    result = subprocess.run(['node', '-e', script], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+
+
+def test_verify_confirmation_handles_malformed_returns():
+    d = Mock()
+    d.timeouts.script = 47
+    # String solta (formato antigo)
+    d.execute_async_script.return_value = 'success_not_observed'
+    diag = {}
+    assert api._verify_confirmation(d, diag) == (False, '')
+    assert diag['reason'] == 'success_not_observed'
+    # None
+    d.execute_async_script.return_value = None
+    diag = {}
+    assert api._verify_confirmation(d, diag) == (False, '')
+    assert diag['reason'] == 'success_not_observed'
+    # Dict com reason inventado
+    d.execute_async_script.return_value = {'reason': 'fake_reason'}
+    diag = {}
+    assert api._verify_confirmation(d, diag) == (False, '')
+    assert diag['reason'] == 'success_not_observed'
+
+
+def test_verify_confirmation_redacts_email_and_tokens_in_evidence():
+    d = Mock()
+    d.timeouts.script = 47
+    d.execute_async_script.return_value = {
+        'reason': 'success_not_observed', 'href': 'https://site.com/verify?verify_email_token=ABC123',
+        'title': 'Confirme alvo@gmail.com por favor', 'status': 404,
+        'sample': ['Clique aqui para alvo@gmail.com', 'Token: verify_email_token=XYZ789', 'ok']
+    }
+    diag = {}
+    api._verify_confirmation(d, diag)
+    assert diag['reason'] == 'destination_error'
+    assert 'ABC123' not in diag['href']
+    assert 'alvo@gmail.com' not in diag['title']
+    assert '[EMAIL]' in diag['title']
+    assert 'XYZ789' not in str(diag['sample'])
+    assert '[REDACTED]' in diag['sample'][1]
+    assert diag['status'] == 404
+    assert len(diag['sample']) == 3

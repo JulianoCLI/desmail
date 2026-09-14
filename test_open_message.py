@@ -192,11 +192,11 @@ def test_stale_event_never_opens_replacement_and_errors_visible():
                 ui._render_cache()
                 table = ui.query_one('#inbox', tui.DataTable)
                 old = table.coordinate_to_cell_key((0, 0)).row_key
-                event = tui.DataTable.RowSelected(table, 0, old)
                 ui._accept(s, dict(state='ok', messages=[dict(mid='new')]), 2)
                 ui._render_cache()
                 with patch.object(tui, 'req', side_effect=OSError('offline body')) as request:
-                    ui.on_data_table_row_selected(event)
+                    # Enter nao tem handler duplicado: a guarda de linha obsoleta vive em _open_key.
+                    ui._open_key(old)
                     assert not request.called
                     ui.screen.set_focus(None)
                     await pilot.press('enter')

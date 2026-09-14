@@ -108,6 +108,8 @@ class CreateReq(BaseModel):
     server: str = "1"
     auto_confirm: bool = Field(default=True, strict=True)
     expected_hosts: list[str] | None = Field(default=None, min_length=1, max_length=20)
+    confirm_host: str | None = Field(default=None, min_length=3, max_length=253)
+    success_text: str | None = Field(default=None, min_length=8, max_length=300)
     timeout_seconds: int = Field(default=600, ge=1, le=3600, strict=True)
 
     @field_validator("expected_hosts")
@@ -131,6 +133,24 @@ class CreateReq(BaseModel):
             normalized.append(host)
         return list(dict.fromkeys(normalized))
 
+    @field_validator("confirm_host")
+    @classmethod
+    def validate_confirm_host(cls, host):
+        if host is None:
+            return None
+        host = host.lower()
+        if (len(host) > 253 or '.' not in host or not _ok_url('https://' + host)
+                or any(not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', label)
+                       for label in host.split('.'))):
+            raise ValueError('confirm_host exige dominio DNS exato, sem URL/porta/wildcard/IP')
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            pass
+        else:
+            raise ValueError('confirm_host nao aceita IP')
+        return host
+
 
 class ConfirmReq(BaseModel):
     session_id: str
@@ -143,6 +163,7 @@ class OpenReq(BaseModel):
     mid: str = Field(min_length=1)
     wait_s: int = Field(default=6, ge=0, le=30)
     revalidate: bool = False
+    link: str | None = Field(default=None, min_length=10, max_length=2048)
 
 
 class PollReq(BaseModel):
@@ -320,6 +341,19 @@ def _redact_url(u):
         return f"{p.scheme}://{p.hostname}/..."
     except Exception:
         return ""
+
+
+_TOKEN_RE = re.compile(r'(?i)(verify_email_token|token|key|code)=[^\s&]+')
+_EMAIL_RE = re.compile(r'[\w.+-]+@[\w-]+\.[\w.-]+')
+
+
+def _redact_text(s):
+    """Remove tokens de query e enderecos de e-mail de texto arbitrario de pagina externa."""
+    if not isinstance(s, str):
+        return ''
+    s = _TOKEN_RE.sub(r'\1=[REDACTED]', s)
+    s = _EMAIL_RE.sub('[EMAIL]', s)
+    return s
 
 
 def _confirm_targets(s, msgs, include_cooldown=False):
@@ -789,6 +823,7 @@ def email_status(session_id: str = Query(...)):
             'monitoring': _monitoring(s),
             'opened': bool(s.get('opened')), 'verified': bool(s.get('verified')),
             'confirmation': s.get('confirmation'),
+            'confirm_host': s.get('confirm_host'), 'success_text': s.get('success_text'),
             'error': s.get('confirm_error') or s.get('error', ''),
             'messages': list(s.get('messages', [])), 'inbox_state': s.get('inbox_state'),
             'expires_at': s.get('expires_at')}
@@ -1269,14 +1304,22 @@ def _read_body_with_retry(d, address, mid, inbox_handle):
 
 _CONFIRM_SUCCESS = 'E-mail confirmado com sucesso. Sua conta já está liberada.'
 _CONFIRM_HOST = 'pokepixel.nietore.com'
-_VERIFY_REASONS = ('success_visible', 'token_expired', 'token_used', 'webgl_unsupported',
-                   'unexpected_origin', 'success_not_observed')
+_VERIFY_REASONS = ('success_visible', 'already_confirmed', 'token_expired', 'token_used',
+                   'webgl_unsupported', 'unexpected_origin', 'destination_error',
+                   'success_not_observed')
 _VERIFY_JS = """
 const expected = arguments[0], host = arguments[1], done = arguments[arguments.length - 1];
 const deadline = performance.now() + 14500;
+let _texts = [];
+function finish(reason) {
+  const sample = reason === 'success_visible' ? [] : _texts.slice(0, 5);
+  let st = null;
+  try { const e = performance.getEntriesByType('navigation')[0]; if (e) st = e.responseStatus; } catch (_) {}
+  done({reason, href: location.href, title: (document.title || '').slice(0, 200), status: st, sample});
+}
 function check() {
   if (location.protocol !== 'https:' || location.hostname !== host || location.port) {
-    done('unexpected_origin'); return;
+    finish('unexpected_origin'); return;
   }
   const normalize = s => s.replace(/\\s+/gu, ' ').trim();
   const visible = Array.from(document.querySelectorAll('body, body *')).filter(el => {
@@ -1290,49 +1333,66 @@ function check() {
     }
     return true;
   });
-  const texts = visible.map(el => normalize(el.innerText));
-  if (texts.includes(expected)) { done('success_visible'); return; }
+  _texts = visible.map(el => normalize(el.innerText)).filter(s => s);
+  if (_texts.includes(expected)) { finish('success_visible'); return; }
   // ponytail: frases negativas exatas; ampliar somente com evidencia redigida do destino.
   for (const [text, reason] of [
       ['Token expirado.', 'token_expired'],
       ['Token já utilizado.', 'token_used'],
       ['Token já foi utilizado.', 'token_used'],
       ['Your browser does not support WebGL', 'webgl_unsupported']]) {
-    if (texts.includes(text)) { done(reason); return; }
+    if (_texts.includes(text)) { finish(reason); return; }
   }
-  if (performance.now() >= deadline) { done('success_not_observed'); return; }
+  if (performance.now() >= deadline) { finish('success_not_observed'); return; }
   setTimeout(check, Math.min(250, deadline - performance.now()));
 }
 check();
 """
 
 
-def _verify_confirmation(d, diagnostic=None):
-    # ponytail: contrato DOM Pokepixel; adicionar outro host so com evidencia propria.
+def _verify_confirmation(d, diagnostic=None, host=None, expected_text=None):
+    # ponytail: contrato DOM; adicionar outro host so com evidencia propria.
     previous = None
     started, started_at = time.monotonic(), time.time()
     reason = 'success_not_observed'
+    extra = {}
+    h = host or _CONFIRM_HOST
+    et = expected_text or _CONFIRM_SUCCESS
     try:
         previous = d.timeouts.script
         d.set_script_timeout(15)
-        text = d.execute_async_script(_VERIFY_JS, _CONFIRM_SUCCESS, _CONFIRM_HOST)
-        if isinstance(text, str):
-            if text in _VERIFY_REASONS:
-                reason = text
-            elif ' '.join(text.split()) == _CONFIRM_SUCCESS:
+        result = d.execute_async_script(_VERIFY_JS, et, h)
+        if isinstance(result, dict):
+            r = result.get('reason', '')
+            if r in _VERIFY_REASONS:
+                reason = r
+            href = result.get('href', '')
+            extra['href'] = _redact_url(href) if isinstance(href, str) else ''
+            title = result.get('title', '')
+            extra['title'] = _redact_text(title[:200]) if isinstance(title, str) else ''
+            status = result.get('status')
+            extra['status'] = status if isinstance(status, int) else None
+            sample = result.get('sample', [])
+            extra['sample'] = [_redact_text(s)[:200] for s in sample if isinstance(s, str)][:5]
+            if reason == 'success_not_observed' and isinstance(extra.get('status'), int) and extra['status'] >= 400:
+                reason = 'destination_error'
+        elif isinstance(result, str):
+            if result in _VERIFY_REASONS:
+                reason = result
+            elif ' '.join(result.split()) == et:
                 reason = 'success_visible'
     except Exception:
         reason = 'driver_error'
     finally:
         if diagnostic is not None:
             diagnostic.update(reason=reason, started_at=started_at, observed_at=time.time(),
-                              elapsed_ms=round((time.monotonic() - started) * 1000))
+                              elapsed_ms=round((time.monotonic() - started) * 1000), **extra)
         if previous is not None:
             try:
                 d.set_script_timeout(previous)
             except Exception:
                 _log_event(stage='confirmation-timeout-restore', result='failed')
-    return reason == 'success_visible', _CONFIRM_SUCCESS if reason == 'success_visible' else ''
+    return reason in ('success_visible', 'already_confirmed'), et if reason == 'success_visible' else ''
 
 
 def _validate_destination(url):
@@ -1378,7 +1438,7 @@ def _navigate_confirmation(d, url, wait_s, attempt=None):
         raise RuntimeError(f'navegacao falhou ({type(e).__name__})')
 
 
-def _open_confirm_isolated(d, inbox_handle, url, wait_s=6, confirmation=None, attempt=None):
+def _open_confirm_isolated(d, inbox_handle, url, wait_s=6, confirmation=None, attempt=None, session=None):
     # Etapa 2: aba criada via new_window, identificada por diff de handles.
     # Nunca navega na aba do inbox; so fecha a aba criada. Falha aborta.
     try:
@@ -1419,18 +1479,40 @@ def _open_confirm_isolated(d, inbox_handle, url, wait_s=6, confirmation=None, at
     state = 'unknown'
     diagnostic = {'reason': 'driver_error', 'started_at': time.time()}
     correlation = {k: (attempt or {}).get(k, '') for k in ('session_id', 'mid')}
+    host = (session or {}).get('confirm_host') or _CONFIRM_HOST
+    et = (session or {}).get('success_text') or _CONFIRM_SUCCESS
     try:
         d.switch_to.window(newh)
         _navigate_confirmation(d, url, wait_s, attempt)
         navigated = time.monotonic()
         diagnostic['navigation_completed_at'] = time.time()
-        verified, evidence = _verify_confirmation(d, diagnostic)
+        verified, evidence = _verify_confirmation(d, diagnostic, host=host, expected_text=et)
+        # token_used + navegacao nuestra = nossa 1a visita consumiu o token.
+        if diagnostic.get('reason') == 'token_used' and (attempt or {}).get('navigation_attempted'):
+            diagnostic['reason'] = 'already_confirmed'
+            verified, evidence = True, et
+        # Re-visita idempotente: segunda chance so apos navegacao real.
+        if not verified and diagnostic.get('reason') in ('success_not_observed', 'driver_error') \
+                and (attempt or {}).get('navigation_attempted') and not (attempt or {}).get('replay_done'):
+            _log_event(**correlation, stage='tab-replay', result=diagnostic.get('reason', ''))
+            try:
+                _navigate_confirmation(d, url, max(0, wait_s - (time.monotonic() - navigated)), attempt)
+                replay_diag = {}
+                _, _ = _verify_confirmation(d, replay_diag, host=host, expected_text=et)
+                if replay_diag.get('reason') == 'token_used':
+                    diagnostic['reason'] = 'already_confirmed'
+                    verified, evidence = True, et
+                elif replay_diag.get('reason') == 'success_visible':
+                    diagnostic['reason'] = 'success_visible'
+                    verified, evidence = True, et
+            except Exception:
+                pass
         if verified:
-            _DRV['origin'] = 'https://' + _CONFIRM_HOST
+            _DRV['origin'] = 'https://' + host
             observed_at = time.time()
         diagnostic.update(verified=verified, evidence=evidence, verified_at=observed_at,
-                          host=_CONFIRM_HOST if diagnostic['reason'] in _VERIFY_REASONS
-                          and diagnostic['reason'] != 'unexpected_origin' else None,
+                          host=host if diagnostic['reason'] in _VERIFY_REASONS
+                          and diagnostic['reason'] not in ('unexpected_origin', 'destination_error') else None,
                           mid=correlation['mid'])
         if confirmation is not None:
             confirmation.update(diagnostic)
@@ -1474,7 +1556,7 @@ def _open_confirm_isolated(d, inbox_handle, url, wait_s=6, confirmation=None, at
         else:
             _log_event(stage="tab-cleanup", result="driver sem resposta, cleanup pulado")
     return not status.startswith("falha ao abrir"), status, {**diagnostic, "verified": verified, "evidence": evidence,
-                                                           "verified_at": observed_at, "state": state}
+                                                            "verified_at": observed_at, "state": state}
 
 
 def _cached_body(d, s, mid):
@@ -1495,7 +1577,7 @@ def _cached_body(d, s, mid):
     return b, error
 
 
-def _confirm_one(d, s, m, wait_s, revalidate=False):
+def _confirm_one(d, s, m, wait_s, revalidate=False, manual_link=None):
     if _expired(s):
         return {'mid': m.get('mid'), 'state': 'expired', 'opened': False,
                 'verified': False, 'status': 'deadline atingido', 'skipped': True}
@@ -1504,8 +1586,14 @@ def _confirm_one(d, s, m, wait_s, revalidate=False):
     if att is None:
         att = {"count": 0, "in_progress": False, "state": "detected"}
         s["attempts"][mid] = att
-    if ((not revalidate and (mid in s["opened"] or mid in s["verified"] or att.get("navigation_attempted")
-                            or att.get('state') in ('ambiguous', 'blocked'))) or att.get("in_progress")
+    # Replay: permitir reabrir apos timeout se navegou mas nao concluiu observacao.
+    prev_reason = (att.get('confirmation') or {}).get('reason', '')
+    can_replay = (att.get("navigation_attempted") and not att.get("replay_done")
+                  and att["count"] <= MAX_ATTEMPTS
+                  and prev_reason in ('success_not_observed', 'driver_error'))
+    skip = not revalidate and not can_replay and (mid in s["opened"] or mid in s["verified"]
+                            or att.get("navigation_attempted") or att.get('state') in ('ambiguous', 'blocked'))
+    if (skip or att.get("in_progress")
             or att["count"] >= MAX_ATTEMPTS
             or time.monotonic() < att.get("next_retry", 0)):
         return {"mid": mid, "subject": m.get("subject"), "link": "",
@@ -1515,26 +1603,69 @@ def _confirm_one(d, s, m, wait_s, revalidate=False):
                 "confirmation": att.get('confirmation')}
     att["in_progress"] = True
     att.update(session_id=s.get('_sid', ''), mid=mid)
+    # Re-visita: nao reler corpo nem incrementar contagem; reabrir mesmo link.
+    is_replay = can_replay and att.get("navigation_attempted") and att.get('confirmation', {}).get('link')
+    if is_replay:
+        link = att['confirmation']['link']
+        att["state"] = "replay"
+        s['phase'] = 'opening_link'
+        confirmation = att.get('confirmation') or {'mid': mid}
+        confirmation.setdefault('mid', mid)
+        s['confirmation'] = confirmation
+        started = time.monotonic()
+        try:
+            ok, status, ev = _open_confirm_isolated(d, _DRV.get("inbox_handle"), link,
+                                                     max(0, min(wait_s, 30)), confirmation, att, session=s)
+        finally:
+            if 'observed_at' not in confirmation:
+                confirmation['observed_at'] = time.time()
+            _log_event(s.get('_sid', ''), mid, 'confirmation', elapsed_ms=round((time.monotonic() - started) * 1000))
+        verified = ok and bool(ev.get("verified"))
+        confirmation['link'] = link
+        att['confirmation'] = dict(confirmation)
+        att["state"] = ev.get('state', 'unknown')
+        if ok:
+            s["opened"].add(mid)
+            att["state"] = "verified" if verified else "unknown"
+            if verified:
+                s["verified"].add(mid)
+        elif att["count"] >= MAX_ATTEMPTS and att['state'] != 'ambiguous':
+            att["state"] = "failed"
+        _log_event(s.get("_sid", ""), mid, "confirm-attempt",
+                   f"{_redact_url(link)} replay=True opened={ok} verified={verified}")
+        att['replay_done'] = True
+        att["in_progress"] = False
+        s['phase'] = ''
+        return {"mid": mid, "subject": m.get("subject"), "link": link,
+                "confirmation": att['confirmation'],
+                "evidence": ev.get('evidence', ''), "verified_at": ev.get('verified_at'),
+                "link_ref": _redact_url(link),
+                "detected": True, "body_loaded": True, "link_found": True,
+                "opened": ok, "verified": verified, "state": att["state"], "status": status}
     s['phase'] = 'reading_body'
     att["state"] = "body-loading"
     att["count"] += 1
     berr, status, ok = '', '', True
     try:
-        b, berr = _cached_body(d, s, mid)
-        body_loaded = bool(b) and not berr
-        candidates = _extract_links(b, confirmation_only=True) if body_loaded else []
-        expected = s.get('expected_hosts')
-        if expected and candidates:
-            candidates = [u for u in candidates if urlparse(u).hostname.lower() in expected]
-            if not candidates:
-                berr = 'expected_hosts: alvo nao corresponde'
-        if len(candidates) > 1:
-            att['state'] = 'ambiguous'
-            return {"mid": mid, "subject": m.get("subject"), "link": "",
-                    "detected": True, "body_loaded": True, "link_found": True,
-                    "opened": False, "verified": False, "state": "ambiguous",
-                    "candidates": candidates, "status": "links ambiguos; escolha manual via /email/body"}
-        link = candidates[0] if candidates else ""
+        if manual_link:
+            link = manual_link
+            berr, body_loaded = '', True
+        else:
+            b, berr = _cached_body(d, s, mid)
+            body_loaded = bool(b) and not berr
+            candidates = _extract_links(b, confirmation_only=True) if body_loaded else []
+            expected = s.get('expected_hosts')
+            if expected and candidates:
+                candidates = [u for u in candidates if urlparse(u).hostname.lower() in expected]
+                if not candidates:
+                    berr = 'expected_hosts: alvo nao corresponde'
+            if len(candidates) > 1:
+                att['state'] = 'ambiguous'
+                return {"mid": mid, "subject": m.get("subject"), "link": "",
+                        "detected": True, "body_loaded": True, "link_found": True,
+                        "opened": False, "verified": False, "state": "ambiguous",
+                        "candidates": candidates, "status": "links ambiguos; escolha manual via /email/body"}
+            link = candidates[0] if candidates else ""
         if not link:
             terminal = att["count"] >= MAX_ATTEMPTS
             att["state"] = "failed" if terminal else "unknown"
@@ -1557,14 +1688,16 @@ def _confirm_one(d, s, m, wait_s, revalidate=False):
                         'reason': 'driver_error', 'started_at': time.time()}
         s['confirmation'] = confirmation
         started = time.monotonic()
+        ok, status, ev = False, '', {'verified': False, 'reason': 'driver_error'}
         try:
-            ok, status, ev = _open_confirm_isolated(d, inbox_h, link, max(0, min(wait_s, 30)), confirmation, att)
+            ok, status, ev = _open_confirm_isolated(d, inbox_h, link, max(0, min(wait_s, 30)), confirmation, att, session=s)
         finally:
             if 'observed_at' not in confirmation:
                 confirmation['observed_at'] = time.time()
+            confirmation['link'] = link
+            att['confirmation'] = dict(confirmation)
             _log_event(s.get('_sid', ''), mid, 'confirmation', elapsed_ms=round((time.monotonic() - started) * 1000))
         verified = ok and bool(ev.get("verified"))
-        att['confirmation'] = dict(confirmation)
         att["state"] = ev.get('state', 'unknown')
         if ok:
             s["opened"].add(mid)
@@ -1695,6 +1828,7 @@ def create(req: CreateReq):
                          "attempts": {}, "status": "connected", "error": "",
                          "_sid": sid, 'auto_confirm': req.auto_confirm,
                          'expected_hosts': req.expected_hosts, 'timeout_seconds': req.timeout_seconds,
+                         'confirm_host': req.confirm_host, 'success_text': req.success_text,
                          'deadline': time.monotonic() + req.timeout_seconds,
                          'expires_at': time.time() + req.timeout_seconds}
         _log_event(sid, "", "create", f"{prov}/{dom}")
@@ -1932,7 +2066,19 @@ def open_message(req: OpenReq):
     try:
         if sessions.get(req.session_id) is not s:
             raise HTTPException(404, "sessao removida")
-        return _confirm_one(_driver_locked(), s, m, req.wait_s, req.revalidate)
+        manual_link = None
+        if req.link:
+            try:
+                _validate_destination(req.link)
+            except ValueError as e:
+                raise HTTPException(400, f"link bloqueado: {e}")
+            d = _driver_locked()
+            b, berr = _cached_body(d, s, req.mid)
+            cands = _extract_links(b, confirmation_only=True) if b and not berr else []
+            if req.link not in cands:
+                raise HTTPException(400, "link nao encontrado nos candidatos de confirmacao do corpo")
+            manual_link = req.link
+        return _confirm_one(_driver_locked(), s, m, req.wait_s, req.revalidate, manual_link=manual_link)
     finally:
         _LOCK.release()
         _poll_end(token)
