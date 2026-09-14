@@ -269,7 +269,7 @@ def test_manual_auto_cache_dedup_progress_and_revalidation():
     s['inbox_state'] = 'ok'
     started, release = threading.Event(), threading.Event()
     url = 'https://pokepixel.nietore.com/play/?verify_email_token=synthetic'
-    def navigate(*args):
+    def navigate(*args, **kwargs):
         started.set()
         assert release.wait(3)
         return True, 'sem evidencia', {'verified': False}

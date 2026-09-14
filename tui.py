@@ -1,4 +1,4 @@
-import json, threading, urllib.request
+import json, threading, time, urllib.request
 from textual import work
 from textual.binding import Binding
 from textual.app import App, ComposeResult
@@ -107,6 +107,14 @@ def _state_label(d):
     if d.get("state") == "in_progress":
         return "Em andamento"
     if d.get("opened"):
+        # Motivo vem do diagnostico do backend; so vale para link realmente aberto.
+        conf = d.get("confirmation")
+        reason = conf.get("reason") if isinstance(conf, dict) else None
+        if reason:
+            st = conf.get("status")
+            if isinstance(st, int) and not isinstance(st, bool):
+                return f"Link aberto - {reason} (HTTP {st})"
+            return f"Link aberto - {reason}"
         return "Link aberto (sem evidencia)"
     if d.get("link_found"):
         return "Falhou"
@@ -138,6 +146,7 @@ class DesmailApp(App):
         self._opening = set()
         self._opened = set()
         self._confirming = set()
+        self._manual_pending = 0
         self._verified_sessions = set()
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -240,18 +249,33 @@ class DesmailApp(App):
         if not s:
             self.write_log("sem sessao: c cria")
             return
-        self._poll_all(s["session_id"])
+        self._manual_poll(s["session_id"])
+    def _manual_poll(self, sid):
+        # Incremento sincrono: o timer pode disparar antes do worker comecar.
+        with self._clock:
+            self._manual_pending += 1
+        self._poll_all(sid)
     @work()
     async def _poll_all(self, sid=None):
-        if not self._poll_lock.acquire(blocking=False):
-            return
+        # Acao manual sempre ganha: timer (sid None) pula se ha manual em voo.
+        if sid is None:
+            with self._clock:
+                if self._manual_pending > 0:
+                    return
         try:
-            await self._poll_cycle(sid)
-        except NoMatches:
-            if self.is_running:
-                raise
+            if not self._poll_lock.acquire(blocking=False):
+                return
+            try:
+                await self._poll_cycle(sid)
+            except NoMatches:
+                if self.is_running:
+                    raise
+            finally:
+                self._poll_lock.release()
         finally:
-            self._poll_lock.release()
+            if sid is not None:
+                with self._clock:
+                    self._manual_pending = max(0, self._manual_pending - 1)
     async def _poll_cycle(self, sid=None):
         self._sequence += 1
         version = self._sequence
@@ -277,7 +301,7 @@ class DesmailApp(App):
             payload = {"wait_s": 6, "auto_confirm": False}
             if sid:
                 payload["session_id"] = sid
-            sw = await self._to_thread(req, "POST", path, payload, 300)
+            sw = await self._to_thread(req, "POST", path, payload, 120)
             if sw.get("skipped"):
                 return
             results = [dict(sw, session_id=sid)] if sid else sw["results"]
@@ -302,11 +326,11 @@ class DesmailApp(App):
             self.write_log(f"{s['email']}: confirmacao em andamento...")
             try:
                 j = await self._to_thread(req, "POST", "/email/autoconfirm",
-                                          {"session_id": s["session_id"], "wait_s": 6}, 300)
+                                          {"session_id": s["session_id"], "wait_s": 6}, 120)
                 for d in j.get("confirmed", []):
                     self.write_log(f"{s['email']} {_state_label(d)} [{d.get('status')}]")
                 if j.get("skipped"):
-                    self.write_log("confirmacao ocupada; proximo ciclo continua")
+                    self.write_log(f"driver ocupado por {j.get('owner')} ha {j.get('age')}s; proximo ciclo continua")
             except Exception as e:
                 self.write_log(f"confirmacao: {_http_err(e)[1]}")
             finally:
@@ -355,7 +379,7 @@ class DesmailApp(App):
             self.write_log("sem sessao: c cria")
             return
         self.write_log(f"auto-confirm {s['email']}...")
-        self._poll_all(s["session_id"])
+        self._manual_poll(s["session_id"])
     def _render(self, s, j):
         # Etapa 6: identidade (session_id, mid); exibe so prefixo.
         t = self.query_one("#inbox", DataTable)
@@ -390,8 +414,6 @@ class DesmailApp(App):
             self._say(f"rm falhou: {e}")
             return
         self._load()
-    def on_data_table_row_selected(self, e: DataTable.RowSelected):
-        self._open_key(e.row_key)
     def check_action(self, action, parameters):
         if action in ("open_message", "revalidate") and isinstance(self.screen, ModalScreen):
             return False
@@ -427,7 +449,19 @@ class DesmailApp(App):
     def _do_open_msg(self, s, mid, revalidate=False):
         key = (s["session_id"], mid)
         try:
-            j = req("POST", "/email/open", dict(session_id=key[0], mid=mid, revalidate=revalidate), timeout=120)
+            # Token do servidor e unico: retry curto cobre sweep em andamento.
+            for attempt in range(3):
+                j = req("POST", "/email/open", dict(session_id=key[0], mid=mid, revalidate=revalidate), timeout=120)
+                if not isinstance(j, dict):
+                    self._say(f"resposta invalida do servidor: {type(j).__name__}")
+                    return
+                if not j.get("skipped"):
+                    break
+                if attempt < 2:
+                    time.sleep(2)
+            else:
+                self._say(f"driver ocupado por {j.get('owner')} ha {j.get('age')}s; tente novamente")
+                return
             if j.get("opened"):
                 self._opened.add(key)
             self._say(f"{_state_label(j)}: {j.get('status') or j.get('error') or j.get('state', 'unknown')}")
